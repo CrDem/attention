@@ -1,20 +1,28 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-extern "C" void qk_mul_launcher(
-    const float* Q, const float* K, float* O,
+extern "C" void flash_attention_launcher(
+    const float* Q, const float* K, const float* V, float* O,
     int batch_size, int num_heads, int seq_len, int d_k,
     float scale);
 
-torch::Tensor flash_attention_qk_mul(
+torch::Tensor flash_attention_forward(
     torch::Tensor query,
     torch::Tensor key,
+    torch::Tensor value,
     float scale = 1.0f) {
     
+    // Проверки
     TORCH_CHECK(query.is_cuda(), "Query must be on CUDA");
     TORCH_CHECK(key.is_cuda(), "Key must be on CUDA");
+    TORCH_CHECK(value.is_cuda(), "Value must be on CUDA");
+    
     TORCH_CHECK(query.sizes() == key.sizes(), "Q and K must have same shape");
-    TORCH_CHECK(query.dtype() == torch::kFloat32, "Only float32 supported");
+    TORCH_CHECK(query.size(0) == value.size(0), "Batch size mismatch");
+    TORCH_CHECK(query.size(1) == value.size(1), "Head count mismatch");
+    TORCH_CHECK(query.size(3) == value.size(3), "Head dimension mismatch");
+    
+    TORCH_CHECK(query.dtype() == torch::kFloat32, "Only float32 supported for this FlashAttention");
     
     auto sizes = query.sizes();
     int batch_size = sizes[0];
@@ -22,29 +30,45 @@ torch::Tensor flash_attention_qk_mul(
     int seq_len = sizes[2];
     int d_k = sizes[3];
     
-    auto output = torch::empty(
-        {batch_size, num_heads, seq_len, seq_len}, 
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    // Reshape tensors to 2D for kernel: (batch*head*seq_len, d_k)
+    auto query_flat = query.view({-1, d_k});
+    auto key_flat = key.view({-1, d_k});
+    auto value_flat = value.view({-1, d_k});
     
-    qk_mul_launcher(
-        query.data_ptr<float>(),
-        key.data_ptr<float>(),
+    // Create output tensor
+    auto output = torch::empty(
+        {batch_size * num_heads * seq_len, d_k}, 
+        torch::TensorOptions()
+            .dtype(torch::kFloat32)
+            .device(torch::kCUDA)
+            .requires_grad(false));
+    
+    // Apply scaling factor (scale / sqrt(d_k))
+    float actual_scale = scale / sqrtf(static_cast<float>(d_k));
+    
+    // Launch kernel with reshaped tensors
+    flash_attention_launcher(
+        query_flat.data_ptr<float>(),
+        key_flat.data_ptr<float>(),
+        value_flat.data_ptr<float>(),
         output.data_ptr<float>(),
         batch_size, num_heads, seq_len, d_k,
-        scale
+        actual_scale
     );
     
-    // Проверяем ошибки
+    // Check for CUDA errors
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        TORCH_CHECK(false, "CUDA error: ", cudaGetErrorString(err));
+        TORCH_CHECK(false, "CUDA error in FlashAttention: ", cudaGetErrorString(err));
     }
     
-    return output;
+    // Reshape output back to original shape
+    return output.view({batch_size, num_heads, seq_len, d_k});
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("qk_mul", &flash_attention_qk_mul, 
-          "Flash Attention Q*K multiplication (CUDA)",
-          py::arg("query"), py::arg("key"), py::arg("scale") = 1.0f);
+    m.def("forward", &flash_attention_forward, 
+          "Flash Attention forward pass (CUDA)",
+          py::arg("query"), py::arg("key"), py::arg("value"), 
+          py::arg("scale") = 1.0f);
 }

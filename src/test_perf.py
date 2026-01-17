@@ -15,37 +15,64 @@ if cuda_build_dir not in sys.path:
     sys.path.insert(0, cuda_build_dir)
     print(f"Added to path: {cuda_build_dir}")
 
-from flash_attention_cuda import qk_mul
+from flash_attention_cuda import forward
 
 batch_size = 1
-d_model = 512
-num_heads = 16
+d_model = 128
+num_heads = 1
 head_dim = d_model // num_heads
-seq_lens = [64, 128, 256, 512, 1024, 2048, 4096]
+seq_lens = [64, 128, 256, 512, 1024]
+''', 2048, 4096'''
 mask = None
 
-attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().half()
+attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().float()
 
 results = []
 num_iters = 100
 
 for seq_len in seq_lens:
     # Create random input tensors
-    query = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=torch.float16)
-    key = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=torch.float16)
-    value = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=torch.float16)
+    query = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=torch.float32)
+    key = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=torch.float32)
+    value = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=torch.float32)
 
     # Create qkv tensor for flash_attn_func
-    q = query.view(batch_size * seq_len, num_heads, head_dim)
-    k = key.view(batch_size * seq_len, num_heads, head_dim)
-    v = value.view(batch_size * seq_len, num_heads, head_dim)
+    q = query.view(batch_size * seq_len, num_heads, head_dim).half()
+    k = key.view(batch_size * seq_len, num_heads, head_dim).half()
+    v = value.view(batch_size * seq_len, num_heads, head_dim).half()
     qkv = torch.stack([q, k, v], dim=1)  # (total_q, 3, num_heads, head_dim)
     cu_seqlens = torch.arange(0, (batch_size + 1) * seq_len, step=seq_len,
                           dtype=torch.int32, device='cuda')
 
-    # Create qkv tensor for our CUDA kernel (batch, heads, seq_len, d_k)
+    # our kernel: [batch, heads, seq_len, d_k]
     q_cuda = query.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
     k_cuda = key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    v_cuda = value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    
+    # size check
+    print(f"q_cuda shape: {q_cuda.shape}")  # need to be (batch, num_heads, seq_len, head_dim)
+    
+    # our kernel check
+    output = forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+
+    def torch_reference_attention(q, k, v, scale=1.0):
+        batch, heads, seq_len, d_k = q.shape
+        
+        # QK^T
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+        
+        # Softmax
+        attn = torch.softmax(scores, dim=-1)
+        
+        # Attention * V
+        output = torch.matmul(attn, v)
+        
+        return output
+
+    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+    output_ref = torch_reference_attention(q_cuda, k_cuda, v_cuda)
+    diff = (output_cuda - output_ref).abs()
+    print(f"Max diff: {diff.max().item():.9f}")
     
     startCore = torch.cuda.Event(enable_timing=True)
     endCore = torch.cuda.Event(enable_timing=True)
@@ -79,25 +106,22 @@ for seq_len in seq_lens:
     # built-in flash attention measure (torch)
     startFlash.record()
     for _ in range(num_iters):
-        flash_attn_func(qkv, cu_seqlens, 0.0, seq_len, softmax_scale=None, causal=False)
+        flash_attn_func(qkv, cu_seqlens, 0.0, seq_len, softmax_scale=1.0/math.sqrt(head_dim), causal=False)
     endFlash.record()
     torch.cuda.synchronize()
 
     # our CUDA kernel
-    # convert to float32
-    q_cuda_f32 = q_cuda.float()
-    k_cuda_f32 = k_cuda.float()
-    scale = 1.0 / math.sqrt(head_dim)
+    # in C++ wrapper: actual_scale = scale / sqrtf(d_k)
     
     # warm-up
     for _ in range(5):
         with torch.no_grad():
-            qk_mul(q_cuda_f32, k_cuda_f32, scale)
+            forward(q_cuda, k_cuda, v_cuda, scale=1.0)
     torch.cuda.synchronize()
     
     startOurCuda.record()
     for _ in range(num_iters):
-        qk_mul(q_cuda_f32, k_cuda_f32, scale)
+        forward(q_cuda, k_cuda, v_cuda, scale=1.0)
     endOurCuda.record()
     torch.cuda.synchronize()
 
@@ -110,7 +134,8 @@ for seq_len in seq_lens:
     print(f"attention core: {coreAvgTimeMs:.3f} ms")
     print(f"full block: {fullAvgTimeMs:.3f} ms")
     print(f"flash attention (built-in): {flashAvgTimeMs:.3f} ms")
-    print(f"our CUDA kernel (Q*K only): {our_cuda_time:.3f} ms")
+    print(f"our CUDA kernel: {our_cuda_time:.3f} ms")
+    print(f"Speedup vs built-in flash: {flashAvgTimeMs/our_cuda_time:.2f}x")
     print()
 
     results.append((seq_len, coreAvgTimeMs, fullAvgTimeMs, flashAvgTimeMs, our_cuda_time))

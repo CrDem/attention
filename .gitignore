@@ -1,4 +1,5 @@
-cuda_build/
+src/cuda/cuda_build/*
+!src/cuda/cuda_build/*.pyd
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
