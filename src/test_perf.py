@@ -18,7 +18,7 @@ if cuda_build_dir not in sys.path:
 from flash_attention_cuda import forward
 
 batch_size = 1
-d_model = 128
+d_model = 64
 num_heads = 1
 head_dim = d_model // num_heads
 seq_lens = [64, 128, 256, 512, 1024]
