@@ -7,7 +7,7 @@ float warp_reduce_max(float val, int width) {
             val = max(val, other);
         }
     }
-    return val;/*__shfl_sync(0xffffffff, val, 0);*/
+    return val;
 }
 
 __inline__ __device__
@@ -18,7 +18,7 @@ float warp_reduce_sum(float val, int width) {
         if (threadIdx.x + offset < width)
             val += other;
     }
-    return val;/*__shfl_sync(0xffffffff, val, 0)*/
+    return val;
 }
 
 const int B = 32; // assert B <= warpsize for warp reduce
@@ -34,9 +34,7 @@ __global__ void flash_attn(
     const int row = blockIdx.x * 32 + threadIdx.y; // Q row
     const int ty = threadIdx.y;
     const int tx = threadIdx.x;
-    const int rowBias = ty * D;
-
-    if (row >= L) return;
+    const bool row_valid = row < L;
 
     float m_prev = -INFINITY;
     float d_prev = 0.0f;
@@ -51,32 +49,30 @@ __global__ void flash_attn(
     float* s_V = &s_K[B*D];
     float* s_VS = &s_V[B*D];
 
+    const int rowBias = ty * D;
     for (int j = tx; j < D; j += B) {
         s_O[rowBias + j] = 0.0f;
-        s_Q[rowBias + j] = Q[row * D + j];
+        s_Q[rowBias + j] = row_valid ? Q[row * D + j] : 0.0f;
     }
-    __syncthreads(); // syncwarps later??
+    __syncthreads();
       
     for (int tile = 0; tile < (L + B - 1) / B; tile++) {
-        int col = (tile * B + tx);
+        int col = tile * B + tx;
+        bool col_valid = col < L;
         
         float x = 0.0f;
         for (int j = tx; j < D; j += B) {
             s_VS[rowBias + j] = 0.0f;
         }
 
-        /*int rowKV = tile * B + ty;
-        if (rowKV < L) {
-            for (int j = tx; j < D; j += B) {
-                s_K[rowBias + j] = K[rowKV * D + j];
-                s_V[rowBias + j] = V[rowKV * D + j];
-            }
+        for (int j = ty; j < D; j += B) { // TODO: coalesced access
+            s_K[tx * D + j] = col_valid ? K[col * D + j] : 0.0f;
         }
-        __syncthreads();*/
+        __syncthreads();
         
-        if (col < L) {
+        if (col_valid) {
             for (int k = 0; k < D; k++) {
-                x += s_Q[rowBias + k] * K[col * D + k];
+                x += s_Q[rowBias + k] * s_K[tx * D + k];
             }
             x *= scale;
         }
@@ -90,17 +86,16 @@ __global__ void flash_attn(
             num = d_prev * expf(m_prev - m);
         }
         float exp_val = 0.0f;
-        if (col < L) {
+        if (col_valid) {
             exp_val = expf(x - m);
         }
         float exp_sum = warp_reduce_sum(exp_val, B);
         float d = num + exp_sum;
         d = __shfl_sync(0xffffffff, d, 0);
 
-        if (col < L) {
+        if (col_valid) {
             float scalar = (expf(x - m) / d);
             for (int j = 0; j < D; j++) {
-                //s_VS[rowBias + j] += scalar * V[(tile * 32 + tx) * D + j];
                 atomicAdd(&s_VS[rowBias + j], scalar * V[(tile * 32 + tx) * D + j]);
             }
         }
@@ -136,7 +131,7 @@ extern "C" void flash_attention_launcher(
     int blocks = batch_size * num_heads * ((seq_len + B - 1) / B);  // Total Q rows
     
     // Shared memory calculation: O + Q = 2*d_k floats
-    size_t shared_mem_size = (5 * B * d_k) * sizeof(float);
+    size_t shared_mem_size = 5 * B * d_k * sizeof(float);
     
     flash_attn<<<blocks, block_size, shared_mem_size>>>(
         Q, K, V, O, seq_len, d_k, scale
