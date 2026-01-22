@@ -1,19 +1,27 @@
-/*__inline__ __device__
-float warp_reduce_max(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = max(val, __shfl_down_sync(0xffffffff, val, offset));
-    return __shfl_sync(0xffffffff, val, 0);
+__inline__ __device__
+float warp_reduce_max(float val, int width) {
+    // width must be in [1, 32]
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, val, offset);
+        if (threadIdx.x + offset < width) {
+            val = max(val, other);
+        }
+    }
+    return val;/*__shfl_sync(0xffffffff, val, 0);*/
 }
 
 __inline__ __device__
-float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    return __shfl_sync(0xffffffff, val, 0);
-} */
+float warp_reduce_sum(float val, int width) {
+    // width must be in [1, 32]
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, val, offset);
+        if (threadIdx.x + offset < width)
+            val += other;
+    }
+    return val;/*__shfl_sync(0xffffffff, val, 0)*/
+}
 
-const int B = 32;
-const int TILE_SIZE = 1; //=b later
+const int B = 32; // assert B <= warpsize for warp reduce
 __global__ void flash_attn(
     const float* __restrict__ Q,
     const float* __restrict__ K,
@@ -23,8 +31,10 @@ __global__ void flash_attn(
     const int D,
     const float scale
 ) {
-    const int row = blockIdx.x * 32 + threadIdx.x; // Q row
-    const int tid = threadIdx.x;
+    const int row = blockIdx.x * 32 + threadIdx.y; // Q row
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int rowBias = ty * D;
 
     if (row >= L) return;
 
@@ -36,66 +46,77 @@ __global__ void flash_attn(
     
     // divide shared memory
     float* s_O = s_memory;
-    float* s_Q = &s_O[32*D];
-    float* s_X = &s_Q[32*D];
-    float* s_VS = &s_X[32*32];
-    //float* s_V = &s_K[B*D];
+    float* s_Q = &s_O[B*D];
+    float* s_K = &s_Q[B*D];
+    float* s_V = &s_K[B*D];
+    float* s_VS = &s_V[B*D];
 
-    for (int j = 0; j < D; j++) {
-        s_O[tid * D + j] = 0.0f;
-        s_Q[tid * D + j] = Q[row * D + j];
+    for (int j = tx; j < D; j += B) {
+        s_O[rowBias + j] = 0.0f;
+        s_Q[rowBias + j] = Q[row * D + j];
     }
     __syncthreads(); // syncwarps later??
       
-    for (int tile = 0; tile < (L+31)/32; tile++) {
-        for (int t = 0; t < 32; t++) {
-            s_X[tid * 32 + t] = 0.0f;
-        }
-        for (int j = 0; j < D; j++) {
-            s_VS[tid * D + j] = 0.0f;
-        }
-        for (int t = 0; t < 32 && ((tile * 32 + t) < L); t++) {
-            for (int k = 0; k < D; k++) {
-                s_X[tid * 32 + t] += s_Q[tid * D + k] * K[(tile * 32 + t) * D + k];
-            }
-        }
-        for (int t = 0; t < 32 && ((tile * 32 + t) < L); t++) {
-            s_X[tid * 32 + t] *= scale;
+    for (int tile = 0; tile < (L + B - 1) / B; tile++) {
+        int col = (tile * B + tx);
+        
+        float x = 0.0f;
+        for (int j = tx; j < D; j += B) {
+            s_VS[rowBias + j] = 0.0f;
         }
 
-        float m_local = -INFINITY;
-        for (int t = 0; t < 32 && ((tile * 32 + t) < L); t++) {
-            m_local = max(m_local, s_X[tid * 32 + t]);
+        /*int rowKV = tile * B + ty;
+        if (rowKV < L) {
+            for (int j = tx; j < D; j += B) {
+                s_K[rowBias + j] = K[rowKV * D + j];
+                s_V[rowBias + j] = V[rowKV * D + j];
+            }
         }
+        __syncthreads();*/
+        
+        if (col < L) {
+            for (int k = 0; k < D; k++) {
+                x += s_Q[rowBias + k] * K[col * D + k];
+            }
+            x *= scale;
+        }
+
+        float m_local = warp_reduce_max(x, B);
         float m = max(m_prev, m_local);
+        m = __shfl_sync(0xffffffff, m, 0);
 
         float num = 0.0f;
         if (d_prev != 0) {
             num = d_prev * expf(m_prev - m);
         }
-        float exp_sum = 0.0f;
-        for (int t = 0; t < 32 && ((tile * 32 + t) < L); t++) {
-            exp_sum += expf(s_X[tid * 32 + t] - m);
+        float exp_val = 0.0f;
+        if (col < L) {
+            exp_val = expf(x - m);
         }
+        float exp_sum = warp_reduce_sum(exp_val, B);
         float d = num + exp_sum;
+        d = __shfl_sync(0xffffffff, d, 0);
 
-        float alpha = num / d;
-        for (int t = 0; t < 32 && ((tile * 32 + t) < L); t++) {
+        if (col < L) {
+            float scalar = (expf(x - m) / d);
             for (int j = 0; j < D; j++) {
-                s_VS[tid * D + j] += (expf(s_X[tid * 32 + t] - m) / d) * V[(tile * 32 + t) * D + j];
+                //s_VS[rowBias + j] += scalar * V[(tile * 32 + tx) * D + j];
+                atomicAdd(&s_VS[rowBias + j], scalar * V[(tile * 32 + tx) * D + j]);
             }
         }
-
-        for (int j = 0; j < D; j++) {
-            s_O[tid * D + j] = s_O[tid * D + j] * alpha + s_VS[tid * D + j];
+        __syncthreads();
+        
+        float alpha = num / d;
+        for (int j = tx; j < D; j += B) {
+            s_O[rowBias + j] = s_O[rowBias + j] * alpha + s_VS[rowBias + j];
         }
 
         m_prev = m;
         d_prev = d;
     }
 
-    for (int j = 0; j < D; j++) {
-        O[row * D + j] = s_O[tid * D + j];
+    for (int j = tx; j < D; j += B) {
+        O[row * D + j] = s_O[rowBias + j];
     }
 }
 
@@ -111,13 +132,13 @@ extern "C" void flash_attention_launcher(
     float scale) {
     
     // each block processes one Q row (i)
-    int threads = B;  // 32 threads per block
-    int blocks = batch_size * num_heads * ((seq_len + 31) / 32);  // Total Q rows
+    dim3 block_size(B, B);
+    int blocks = batch_size * num_heads * ((seq_len + B - 1) / B);  // Total Q rows
     
     // Shared memory calculation: O + Q = 2*d_k floats
-    size_t shared_mem_size = ((3 * 32 * d_k) + 32*32) * sizeof(float);
+    size_t shared_mem_size = (5 * B * d_k) * sizeof(float);
     
-    flash_attn<<<blocks, threads, shared_mem_size>>>(
+    flash_attn<<<blocks, block_size, shared_mem_size>>>(
         Q, K, V, O, seq_len, d_k, scale
     );
 }
