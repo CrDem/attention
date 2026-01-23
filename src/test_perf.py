@@ -53,7 +53,12 @@ for seq_len in seq_lens:
     print(f"q_cuda shape: {q_cuda.shape}")  # need to be (batch, num_heads, seq_len, head_dim)
     
     # our kernel check
-    output = forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+    try:
+        output = forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+        print(f"Output contains nan: {torch.isnan(output).any()}")
+        print(f"Output contains inf: {torch.isinf(output).any()}")
+    except Exception as e:
+        print(f"Error during forward call: {e}")
 
     def torch_reference_attention(q, k, v, scale=1.0):
         batch, heads, seq_len, d_k = q.shape

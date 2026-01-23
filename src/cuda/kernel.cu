@@ -22,6 +22,7 @@ float warp_reduce_sum(float val, int width) {
 }
 
 const int B = 32; // assert B <= warpsize for warp reduce
+const int numWarps = 32;
 __global__ void flash_attn(
     const float* __restrict__ Q,
     const float* __restrict__ K,
@@ -31,7 +32,7 @@ __global__ void flash_attn(
     const int D,
     const float scale
 ) {
-    const int row = blockIdx.x * 32 + threadIdx.y; // Q row
+    const int row = blockIdx.x * blockDim.y + threadIdx.y; // Q row
     const int ty = threadIdx.y;
     const int tx = threadIdx.x;
     const bool row_valid = row < L;
@@ -44,10 +45,10 @@ __global__ void flash_attn(
     
     // divide shared memory
     float* s_O = s_memory;
-    float* s_Q = &s_O[B*D];
-    float* s_K = &s_Q[B*D];
-    float* s_V = &s_K[B*D];
-    float* s_VS = &s_V[B*D];
+    float* s_Q = &s_O[numWarps*D];
+    float* s_K = &s_Q[numWarps*D];
+    //float* s_V = &s_K[B*D];
+    float* s_VS = &s_K[B*D];
 
     const int rowBias = ty * D;
     for (int j = tx; j < D; j += B) {
@@ -65,7 +66,7 @@ __global__ void flash_attn(
             s_VS[rowBias + j] = 0.0f;
         }
 
-        for (int j = ty; j < D; j += B) { // TODO: coalesced access
+        for (int j = ty; j < D; j += numWarps) { // TODO: coalesced access if possible
             s_K[tx * D + j] = col_valid ? K[col * D + j] : 0.0f;
         }
         __syncthreads();
@@ -96,7 +97,7 @@ __global__ void flash_attn(
         if (col_valid) {
             float scalar = (expf(x - m) / d);
             for (int j = 0; j < D; j++) {
-                atomicAdd(&s_VS[rowBias + j], scalar * V[(tile * 32 + tx) * D + j]);
+                atomicAdd(&s_VS[rowBias + j], scalar * V[(tile * B + tx) * D + j]);
             }
         }
         __syncthreads();
@@ -110,8 +111,10 @@ __global__ void flash_attn(
         d_prev = d;
     }
 
-    for (int j = tx; j < D; j += B) {
-        O[row * D + j] = s_O[rowBias + j];
+    if (row_valid) {
+        for (int j = tx; j < D; j += B) {
+            O[row * D + j] = s_O[rowBias + j];
+        }
     }
 }
 
@@ -126,12 +129,10 @@ extern "C" void flash_attention_launcher(
     int d_k,
     float scale) {
     
-    // each block processes one Q row (i)
-    dim3 block_size(B, B);
-    int blocks = batch_size * num_heads * ((seq_len + B - 1) / B);  // Total Q rows
+    dim3 block_size(B, numWarps);
+    int blocks = batch_size * num_heads * ((seq_len + numWarps - 1) / numWarps);  // Total Q rows
     
-    // Shared memory calculation: O + Q = 2*d_k floats
-    size_t shared_mem_size = 5 * B * d_k * sizeof(float);
+    size_t shared_mem_size = (numWarps * d_k * 3 + B * d_k) * sizeof(float);
     
     flash_attn<<<blocks, block_size, shared_mem_size>>>(
         Q, K, V, O, seq_len, d_k, scale
