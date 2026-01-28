@@ -1,28 +1,21 @@
+const unsigned mask = 0xffffffff;
 __inline__ __device__
-float warp_reduce_max(float val, int width) {
-    // width must be in [1, 32]
+float warp_reduce_max(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(0xffffffff, val, offset);
-        if (threadIdx.x + offset < width) {
-            val = max(val, other);
-        }
+        val = max(val, __shfl_down_sync(mask, val, offset));
     }
     return val;
 }
 
 __inline__ __device__
-float warp_reduce_sum(float val, int width) {
-    // width must be in [1, 32]
+float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(0xffffffff, val, offset);
-        if (threadIdx.x + offset < width)
-            val += other;
+        val += __shfl_down_sync(mask, val, offset);
     }
     return val;
 }
 
-const int B = 32; // assert B <= warpsize for warp reduce
-const int numWarps = 32;
+const int B = 32; // assert B == warpsize for warp reduce
 __global__ void flash_attn(
     const float* __restrict__ Q,
     const float* __restrict__ K,
@@ -32,89 +25,93 @@ __global__ void flash_attn(
     const int D,
     const float scale
 ) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y; // Q row
+    const int numWarps = blockDim.y;
+    const int tx = threadIdx.x; 
     const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
+    const int row = blockIdx.x * numWarps + ty;
     const bool row_valid = row < L;
 
     float m_prev = -INFINITY;
     float d_prev = 0.0f;
 
-    // dynamic shared memory for O, Q, K, V
-    extern __shared__ float s_memory[];
-    
-    // divide shared memory
-    float* s_O = s_memory;
+    extern __shared__ float s_mem[];
+
+    float* s_O = s_mem;
     float* s_Q = &s_O[numWarps*D];
     float* s_K = &s_Q[numWarps*D];
-    //float* s_V = &s_K[B*D];
-    float* s_VS = &s_K[B*D];
+    float* s_V = &s_K[B*D];
+    float* s_A = &s_V[B*D];
 
+    // load Q, zeroing O
     const int rowBias = ty * D;
     for (int j = tx; j < D; j += B) {
         s_O[rowBias + j] = 0.0f;
         s_Q[rowBias + j] = row_valid ? Q[row * D + j] : 0.0f;
     }
     __syncthreads();
-      
-    for (int tile = 0; tile < (L + B - 1) / B; tile++) {
+
+    const int num_tiles = (L + B - 1) / B;
+    for (int tile = 0; tile < num_tiles; tile++) {
+
+        int num_cols_valid = min(B, L - tile * B);
+
         int col = tile * B + tx;
         bool col_valid = col < L;
-        
-        float x = 0.0f;
-        for (int j = tx; j < D; j += B) {
-            s_VS[rowBias + j] = 0.0f;
-        }
 
-        for (int j = ty; j < D; j += numWarps) { // TODO: coalesced access if possible
+        // load K, V
+        for (int j = ty; j < D; j += numWarps) {
             s_K[tx * D + j] = col_valid ? K[col * D + j] : 0.0f;
+            s_V[tx * D + j] = col_valid ? V[col * D + j] : 0.0f;
         }
         __syncthreads();
-        
+
+        // QK
+        float x = -INFINITY;
         if (col_valid) {
+            float acc = 0.0f;
             for (int k = 0; k < D; k++) {
-                x += s_Q[rowBias + k] * s_K[tx * D + k];
+                acc += s_Q[rowBias + k] * s_K[tx * D + k];
             }
-            x *= scale;
+            x = acc * scale;
         }
 
-        float m_local = warp_reduce_max(x, B);
+        // softmax
+        float m_local = warp_reduce_max(x);
         float m = max(m_prev, m_local);
-        m = __shfl_sync(0xffffffff, m, 0);
+        m = __shfl_sync(mask, m, 0);
 
-        float num = 0.0f;
-        if (d_prev != 0) {
-            num = d_prev * expf(m_prev - m);
-        }
-        float exp_val = 0.0f;
-        if (col_valid) {
-            exp_val = expf(x - m);
-        }
-        float exp_sum = warp_reduce_sum(exp_val, B);
+        float num = (d_prev > 0.0f) ? d_prev * expf(m_prev - m) : 0.0f;
+
+        float exp_val = col_valid ? expf(x - m) : 0.0f;
+        float exp_sum = warp_reduce_sum(exp_val);
+
         float d = num + exp_sum;
-        d = __shfl_sync(0xffffffff, d, 0);
+        d = __shfl_sync(mask, d, 0);
 
-        if (col_valid) {
-            float scalar = (expf(x - m) / d);
-            for (int j = 0; j < D; j++) {
-                atomicAdd(&s_VS[rowBias + j], scalar * V[(tile * B + tx) * D + j]);
-            }
-        }
+        s_A[ty * B + tx] = col_valid ? exp_val / d : 0.0f;
         __syncthreads();
-        
+
+        // O update
         float alpha = num / d;
         for (int j = tx; j < D; j += B) {
-            s_O[rowBias + j] = s_O[rowBias + j] * alpha + s_VS[rowBias + j];
+            float acc = 0.0f;
+            for (int c = 0; c < num_cols_valid; c++) {
+                acc += s_A[ty * B + c] * s_V[c * D + j];
+            }
+            s_O[rowBias + j] = s_O[rowBias + j] * alpha + acc;
         }
 
         m_prev = m;
         d_prev = d;
+
+        __syncthreads(); // можно удалить если грузить V в smem между первым и вторым синком, а не вместе с К
+        // в таком случае получим 2 синка вместо трех в цикле, но раздельную загрузку К и V
+        // по перфу получается как будто одно и то же, так что оставил совместную загрузку для читаемости
     }
 
-    if (row_valid) {
-        for (int j = tx; j < D; j += B) {
-            O[row * D + j] = s_O[rowBias + j];
-        }
+    // store O
+    for (int j = tx; j < D; j += B) {
+        if (row_valid) O[row * D + j] = s_O[rowBias + j];
     }
 }
 
@@ -127,12 +124,13 @@ extern "C" void flash_attention_launcher(
     int num_heads,
     int seq_len,
     int d_k,
-    float scale) {
+    float scale,
+    int num_warps) {
     
-    dim3 block_size(B, numWarps);
-    int blocks = batch_size * num_heads * ((seq_len + numWarps - 1) / numWarps);  // Total Q rows
+    dim3 block_size(B, num_warps);
+    int blocks = batch_size * num_heads * ((seq_len + num_warps - 1) / num_warps);  // Total Q rows
     
-    size_t shared_mem_size = (numWarps * d_k * 3 + B * d_k) * sizeof(float);
+    size_t shared_mem_size = (num_warps * d_k * 2 + B * d_k * 2 + B * num_warps) * sizeof(float);
     
     flash_attn<<<blocks, block_size, shared_mem_size>>>(
         Q, K, V, O, seq_len, d_k, scale

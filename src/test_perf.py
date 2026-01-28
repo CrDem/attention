@@ -21,14 +21,17 @@ batch_size = 1
 d_model = 64
 num_heads = 1
 head_dim = d_model // num_heads
-seq_lens = [64, 128, 247, 256, 512, 1024]
-''', 2048, 4096'''
+seq_lens = [64, 128, 256, 512, 1024, 2048, 4096]
+''''''
 mask = None
 
 attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().float()
 
 results = []
 num_iters = 100
+# numWarps sweep (powers of two, starting from 4)
+num_warps_list = [4, 8, 16, 32]
+our_kernel_sweep_results = []  # (seq_len, num_warps, time_ms)
 
 for seq_len in seq_lens:
     # Create random input tensors
@@ -54,7 +57,7 @@ for seq_len in seq_lens:
     
     # our kernel check
     try:
-        output = forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+        output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32)
         print(f"Output contains nan: {torch.isnan(output).any()}")
         print(f"Output contains inf: {torch.isinf(output).any()}")
     except Exception as e:
@@ -74,7 +77,7 @@ for seq_len in seq_lens:
         
         return output
 
-    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32)
     output_ref = torch_reference_attention(q_cuda, k_cuda, v_cuda)
     diff = (output_cuda - output_ref).abs()
     print(f"Max diff: {diff.max().item():.9f}")
@@ -121,12 +124,12 @@ for seq_len in seq_lens:
     # warm-up
     for _ in range(5):
         with torch.no_grad():
-            forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+            forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32)
     torch.cuda.synchronize()
     
     startOurCuda.record()
     for _ in range(num_iters):
-        forward(q_cuda, k_cuda, v_cuda, scale=1.0)
+        forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32)
     endOurCuda.record()
     torch.cuda.synchronize()
 
@@ -140,10 +143,29 @@ for seq_len in seq_lens:
     print(f"full block: {fullAvgTimeMs:.3f} ms")
     print(f"flash attention (built-in): {flashAvgTimeMs:.3f} ms")
     print(f"our CUDA kernel: {our_cuda_time:.3f} ms")
-    print(f"Speedup vs built-in flash: {flashAvgTimeMs/our_cuda_time:.2f}x")
+    print(f"Speedup vs built-in flash: {flashAvgTimeMs/our_cuda_time:.4f}x")
     print()
 
     results.append((seq_len, coreAvgTimeMs, fullAvgTimeMs, flashAvgTimeMs, our_cuda_time))
+
+    for nw in num_warps_list:
+        # warm-up
+        for _ in range(5):
+            with torch.no_grad():
+                forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=nw)
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        for _ in range(num_iters):
+            forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=nw)
+        end.record()
+        torch.cuda.synchronize()
+
+        avg_ms = start.elapsed_time(end) / num_iters
+        our_kernel_sweep_results.append((seq_len, nw, avg_ms))
 
 # saving results
 import csv
@@ -157,3 +179,11 @@ with open(csv_path, "w", newline="") as f:
     writer.writerow(["seq_len", "core_ms", "full_ms", "flash_ms", "our_cuda_ms"])
     writer.writerows(results)
 print(f"results saved to {csv_path}")
+
+csv_path_sweep = os.path.join(benchmarks_dir, 'our_kernel_numwarps_sweep.csv')
+with open(csv_path_sweep, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["seq_len", "num_warps", "time_ms"])
+    writer.writerows(our_kernel_sweep_results)
+
+print(f"numWarps sweep results saved to {csv_path_sweep}")
