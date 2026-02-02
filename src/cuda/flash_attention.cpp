@@ -1,8 +1,9 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp16.h>
 
 extern "C" void flash_attention_launcher(
-    const float* Q, const float* K, const float* V, float* O,
+    const __half* Q, const __half* K, const __half* V, __half* O,
     int batch_size, int num_heads, int seq_len, int d_k,
     float scale, int num_warps);
 
@@ -23,7 +24,7 @@ torch::Tensor flash_attention_forward(
     TORCH_CHECK(query.size(1) == value.size(1), "Head count mismatch");
     TORCH_CHECK(query.size(3) == value.size(3), "Head dimension mismatch");
     
-    TORCH_CHECK(query.dtype() == torch::kFloat32, "Only float32 supported for this FlashAttention");
+    TORCH_CHECK(query.dtype() == torch::kFloat16, "Only float16 supported for this FlashAttention");
     
     auto sizes = query.sizes();
     int batch_size = sizes[0];
@@ -40,7 +41,7 @@ torch::Tensor flash_attention_forward(
     auto output = torch::empty(
         {batch_size * num_heads * seq_len, d_k}, 
         torch::TensorOptions()
-            .dtype(torch::kFloat32)
+            .dtype(torch::kFloat16)
             .device(torch::kCUDA)
             .requires_grad(false));
     
@@ -49,10 +50,10 @@ torch::Tensor flash_attention_forward(
     
     // Launch kernel with reshaped tensors
     flash_attention_launcher(
-        query_flat.data_ptr<float>(),
-        key_flat.data_ptr<float>(),
-        value_flat.data_ptr<float>(),
-        output.data_ptr<float>(),
+        reinterpret_cast<const __half*>(query_flat.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(key_flat.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(value_flat.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
         batch_size, num_heads, seq_len, d_k,
         actual_scale,
         num_warps
