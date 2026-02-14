@@ -23,7 +23,7 @@ float warp_reduce_sum(float val) {
     return val;
 }
 
-const int Bc = 32; // assert B == warpsize for warp reduce
+const int Bc = 32; // assert Bc == warpsize for warp reduce
 __global__ void flash_attn(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -35,8 +35,10 @@ __global__ void flash_attn(
 ) {
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-
-    const int Br = 32;
+    
+    const int numWarps = blockDim.y;
+    const int Br = blockDim.y * 8;
+    
     const int localTileRow = ty / 2 * 16;
     const int localTileCol = ty % 2 * 16;
 
@@ -46,8 +48,8 @@ __global__ void flash_attn(
     float* s_m_prev = &s_O[Br * D];
     float* s_d_prev = &s_m_prev[Br];
     float* s_A = &s_d_prev[Br];
-    __half* s_A_half = (__half*)&s_A[Bc * Br];
-    __half* s_Q = &s_A_half[Bc * Br];
+    __half* s_A_half = (__half*)&s_A[Br * Bc];
+    __half* s_Q = &s_A_half[Br * Bc];
     __half* s_K = &s_Q[Br * D];
     __half* s_V = &s_K[Bc * D];
 
@@ -55,14 +57,13 @@ __global__ void flash_attn(
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a1_frag;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a2_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b1_frag; // col major
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b2_frag; // row major
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
 
     // aliases for code readability
     auto& q_frag = a1_frag;
     auto& k_frag = b1_frag;
 
-    auto& v_frag = b2_frag;
+    auto& v_frag = b1_frag;
 
     // init m_prev, d_prev
     if (tx < 8) {
@@ -70,7 +71,7 @@ __global__ void flash_attn(
         s_d_prev[ty * 8 + tx] = 0.0f;
     }
     // load Q, zeroing O
-    for (int localRow = ty; localRow < Br; localRow += 4) {
+    for (int localRow = ty; localRow < Br; localRow += numWarps) {
         int globalRow = blockIdx.x * Br + localRow;
         for (int d = tx; d < D; d += 32) {
             s_O[localRow * D + d] = 0.0f;
@@ -82,15 +83,14 @@ __global__ void flash_attn(
     for (int tile = 0; tile < num_tiles; tile++) {
         int aTileCol = tile * Bc;
         int aTileNumColsValid = min(Bc, L - tile * Bc);
-        int aCol = tx; // pos in warp
-        bool aColValid = aTileCol + aCol < L;
+        bool aColValid = aTileCol + tx < L;
 
         // load K, V
-        for (int localRow = ty; localRow < Bc; localRow += 4) {
+        for (int localRow = ty; localRow < Bc; localRow += numWarps) {
             int globalRow = aTileCol + localRow;
             for (int d = tx; d < D; d += 32) {
                 s_K[localRow * D + d] = globalRow < L ? K[globalRow * D + d] : __float2half(0.0f);
-                s_V[localRow * D + d] = globalRow < L ? V[globalRow * D + d] : __float2half(0.0f);
+                s_V[d * Bc + localRow] = globalRow < L ? V[globalRow * D + d] : __float2half(0.0f); // transpose
             }
         }
         __syncthreads();
@@ -113,7 +113,7 @@ __global__ void flash_attn(
         wmma::store_matrix_sync(&s_A[localTileRow * Bc + localTileCol], acc_frag, 32, wmma::mem_row_major);
         __syncthreads();
 
-        for (int aRow = ty; aRow < Br; aRow += 4) {
+        for (int aRow = ty; aRow < Br; aRow += numWarps) {
             float x = aColValid ? s_A[aRow * Bc + tx] * scale : -CUDART_INF_F;
 
             // softmax
@@ -135,12 +135,12 @@ __global__ void flash_attn(
 
             // O scaling
             float alpha;
-            if (aCol == 0) {
+            if (tx == 0) {
                 alpha = num / d;
             }
             alpha = __shfl_sync(mask, alpha, 0);
 
-            for (int j = aCol; j < D; j += Bc) {
+            for (int j = tx; j < D; j += Bc) {
                 s_O[aRow * D + j] = s_O[aRow * D + j] * alpha;
             }
 
@@ -157,11 +157,11 @@ __global__ void flash_attn(
             wmma::load_matrix_sync(acc_frag, &s_O[localTileRow * D + j + localTileCol], D, wmma::mem_row_major);
 
             // 1st half
-            wmma::load_matrix_sync(v_frag, &s_V[j + localTileCol], D);
+            wmma::load_matrix_sync(v_frag, &s_V[(j + localTileCol) * Bc], Bc);
             wmma::mma_sync(acc_frag, a1_frag, v_frag, acc_frag);
 
             // 2nd half
-            wmma::load_matrix_sync(v_frag, &s_V[16 * D + j + localTileCol], D);
+            wmma::load_matrix_sync(v_frag, &s_V[(j + localTileCol) * Bc + 16], Bc);
             wmma::mma_sync(acc_frag, a2_frag, v_frag, acc_frag);
             
             wmma::store_matrix_sync(&s_O[localTileRow * D + j + localTileCol], acc_frag, D, wmma::mem_row_major);
@@ -173,7 +173,7 @@ __global__ void flash_attn(
     }
 
     // s_O -> O
-    for (int localRow = ty; localRow < Br; localRow += 4) {
+    for (int localRow = ty; localRow < Br; localRow += numWarps) {
         int globalRow = blockIdx.x * Br + localRow;
         if (globalRow < L) {
             for (int d = tx; d < D; d += 32) {
@@ -193,18 +193,18 @@ extern "C" void flash_attention_launcher(
     int seq_len,
     int d_k,
     float scale,
-    int num_warps
+    int Br
 ) {
-    dim3 block_size(32, 4);
-    int blocks = batch_size * num_heads * ((seq_len + num_warps - 1) / num_warps); // Total Q rows
+    dim3 block_size(32, Br/8);
+    int blocks = batch_size * num_heads * ((seq_len + Br - 1) / Br); // Total Q rows
 
     size_t shared_mem_size =
-        (num_warps * d_k * sizeof(float)) +   // s_O
-        (Bc * num_warps * sizeof(float)) +    // s_A
-        (Bc * num_warps * sizeof(__half)) +   // s_A_half
-        (num_warps * d_k * sizeof(__half)) +  // s_Q
+        (Br * d_k * sizeof(float)) +   // s_O
+        (Bc * Br * sizeof(float)) +    // s_A
+        (Bc * Br * sizeof(__half)) +   // s_A_half
+        (Br * d_k * sizeof(__half)) +  // s_Q
         (Bc * d_k * sizeof(__half)) * 2 +     // s_K, s_V
-        (32 * sizeof(float)) * 2;             // s_m_prev, s_d_prev
+        (Br * sizeof(float)) * 2;             // s_m_prev, s_d_prev
         
     flash_attn<<<blocks, block_size, shared_mem_size>>>(
         Q, K, V, O, seq_len, d_k, scale

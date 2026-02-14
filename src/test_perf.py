@@ -30,11 +30,12 @@ mask = None
 attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().float()
 
 results = []
-num_iters = 1000 if IS_BENCH else 1000
-num_warms = 100 if IS_BENCH else 100
-# numWarps sweep (powers of two, starting from 4)
-num_warps_list = [4, 8, 16, 32]
-our_kernel_sweep_results = []  # (seq_len, num_warps, time_ms)
+num_iters = 1000 if IS_BENCH else 50
+num_warms = 100 if IS_BENCH else 5
+Br = 64 if IS_BENCH else 64
+# Br sweep (powers of two, starting from 16)
+Br_list = [16, 32, 64]
+our_kernel_sweep_results = []  # (seq_len, Br, time_ms)
 
 for seq_len in seq_lens:
     # Create random input tensors
@@ -60,7 +61,7 @@ for seq_len in seq_lens:
     
     # our kernel check
     try:
-        output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32 if not IS_BENCH else 32)
+        output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
         print(f"Output contains nan: {torch.isnan(output).any()}")
         print(f"Output contains inf: {torch.isinf(output).any()}")
     except Exception as e:
@@ -77,7 +78,7 @@ for seq_len in seq_lens:
         output = torch.matmul(attn, vf)
         return output.half()
 
-    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32 if not IS_BENCH else 32)
+    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
     output_ref = torch_reference_attention(q_cuda, k_cuda, v_cuda)
     diff = (output_cuda.float() - output_ref.float()).abs()
     print(f"Max diff: {diff.max().item():.9f}")
@@ -124,12 +125,12 @@ for seq_len in seq_lens:
     # warm-up
     for _ in range(num_warms):
         with torch.no_grad():
-            forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32 if not IS_BENCH else 32)
+            forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
     torch.cuda.synchronize()
     
     startOurCuda.record()
     for _ in range(num_iters):
-        forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=32 if not IS_BENCH else 32)
+        forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
     endOurCuda.record()
     torch.cuda.synchronize()
 
@@ -148,25 +149,24 @@ for seq_len in seq_lens:
 
     results.append((seq_len, coreAvgTimeMs, fullAvgTimeMs, flashAvgTimeMs, our_cuda_time))
 
-    if IS_BENCH:
-        for nw in num_warps_list:
-            # warm-up
-            for _ in range(num_warms):
-                with torch.no_grad():
-                    forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=nw)
-            torch.cuda.synchronize()
+    for br_now in Br_list:
+        # warm-up
+        for _ in range(num_warms):
+            with torch.no_grad():
+                forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=br_now)
+        torch.cuda.synchronize()
 
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
-            start.record()
-            for _ in range(num_iters):
-                forward(q_cuda, k_cuda, v_cuda, scale=1.0, num_warps=nw)
-            end.record()
-            torch.cuda.synchronize()
+        start.record()
+        for _ in range(num_iters):
+            forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=br_now)
+        end.record()
+        torch.cuda.synchronize()
 
-            avg_ms = start.elapsed_time(end) / num_iters
-            our_kernel_sweep_results.append((seq_len, nw, avg_ms))
+        avg_ms = start.elapsed_time(end) / num_iters
+        our_kernel_sweep_results.append((seq_len, br_now, avg_ms))
 
 # saving results
 import csv
@@ -181,11 +181,10 @@ with open(csv_path, "w", newline="") as f:
     writer.writerows(results)
 print(f"results saved to {csv_path}")
 
-if IS_BENCH:
-    csv_path_sweep = os.path.join(benchmarks_dir, 'our_kernel_numwarps_sweep.csv')
-    with open(csv_path_sweep, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["seq_len", "num_warps", "time_ms"])
-        writer.writerows(our_kernel_sweep_results)
+csv_path_sweep = os.path.join(benchmarks_dir, 'our_kernel_Br_sweep.csv')
+with open(csv_path_sweep, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["seq_len", "Br", "time_ms"])
+    writer.writerows(our_kernel_sweep_results)
 
-    print(f"numWarps sweep results saved to {csv_path_sweep}")
+print(f"Br sweep results saved to {csv_path_sweep}")

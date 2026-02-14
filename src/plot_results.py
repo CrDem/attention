@@ -27,25 +27,25 @@ plt.savefig("src/benchmarks/perf_plot.png")
 print("plot saved to src/benchmarks/perf_plot.png")
 plt.show()
 
-df2 = pd.read_csv("src/benchmarks/our_kernel_numwarps_sweep.csv")
+df2 = pd.read_csv("src/benchmarks/our_kernel_Br_sweep.csv")
 
 plt.figure(figsize=(8, 5))
-for nw in sorted(df2["num_warps"].unique()):
-    sub = df2[df2["num_warps"] == nw]
+for br_now in sorted(df2["Br"].unique()):
+    sub = df2[df2["Br"] == br_now]
     plt.plot(
         sub["seq_len"],
         sub["time_ms"],
         marker="o",
-        label=f"numWarps={nw}"
+        label=f"Br={br_now}"
     )
 
 plt.xscale("log", base=2)
 plt.yscale("log")
 plt.xlabel("Sequence length")
 plt.ylabel("Time (ms)")
-plt.title("Our FlashAttention kernel: numWarps sweep")
+plt.title("Our FlashAttention kernel: Br sweep")
 plt.grid(True, which="both", linestyle="--", linewidth=0.5)
 plt.legend()
 plt.tight_layout()
-plt.savefig("src/benchmarks/our_kernel_numwarps_sweep.png")
+plt.savefig("src/benchmarks/our_kernel_Br_sweep.png")
 plt.show()

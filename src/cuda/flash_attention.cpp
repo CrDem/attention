@@ -5,14 +5,14 @@
 extern "C" void flash_attention_launcher(
     const __half* Q, const __half* K, const __half* V, __half* O,
     int batch_size, int num_heads, int seq_len, int d_k,
-    float scale, int num_warps);
+    float scale, int Br);
 
 torch::Tensor flash_attention_forward(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value,
     float scale = 1.0f,
-    int num_warps = 32) {
+    int Br = 32) {
     
     // Проверки
     TORCH_CHECK(query.is_cuda(), "Query must be on CUDA");
@@ -56,7 +56,7 @@ torch::Tensor flash_attention_forward(
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
         batch_size, num_heads, seq_len, d_k,
         actual_scale,
-        num_warps
+        Br
     );
     
     // Check for CUDA errors
@@ -74,5 +74,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Flash Attention forward pass (CUDA)",
       py::arg("query"), py::arg("key"), py::arg("value"),
       py::arg("scale") = 1.0f,
-      py::arg("num_warps") = 32);
+      py::arg("Br") = 32);
 }
