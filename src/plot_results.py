@@ -9,7 +9,7 @@ plt.figure(figsize=(8,5))
 plt.plot(df["seq_len"], df["core_ms"], marker="o", alpha = 0.7, label="Attention core")
 plt.plot(df["seq_len"], df["full_ms"], marker="o", label="Full block")
 plt.plot(df["seq_len"], df["flash_ms"], marker="x", ls = '--', alpha = 0.7, label="Flash attention")
-plt.plot(df["seq_len"], df["our_cuda_ms"], marker="s", alpha=0.8, label="Our CUDA (32x32)")
+plt.plot(df["seq_len"], df["our_cuda_ms"], marker="s", alpha=0.8, label="Our CUDA kernel")
 
 plt.xticks(df["seq_len"])
 seq_ticks = sorted(df["seq_len"].unique().tolist())
