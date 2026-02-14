@@ -18,8 +18,9 @@ try:
             '-arch=sm_75',
             '--use_fast_math',
             '-std=c++14',
+            '--ptxas-options=-v',
         ],
-        verbose=False,
+        verbose=True,
         build_directory=build_dir
     )
     print(f"CUDA extension built successfully to {build_dir}")
