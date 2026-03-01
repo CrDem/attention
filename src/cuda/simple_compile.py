@@ -13,11 +13,9 @@ try:
     cuda_ext = load(
         name='flash_attention_cuda',
         sources=[cpp_dir, cu_dir],
-        extra_cflags=['/std:c++17'],
         extra_cuda_cflags=[
             '-arch=sm_75',
             '--use_fast_math',
-            '-std=c++14',
             '--ptxas-options=-v',
         ],
         verbose=True,
