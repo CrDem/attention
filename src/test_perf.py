@@ -7,6 +7,7 @@ from attention import MultiHeadAttentionBlock
 from flash_attn.flash_attn_interface import flash_attn_func
 
 IS_BENCH = "-bench" in sys.argv
+IS_DEBUG = "-debug" in sys.argv
 
 # cuda_build folder path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,15 +24,15 @@ batch_size = 1
 d_model = 64
 num_heads = 1
 head_dim = d_model // num_heads
-seq_lens = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
-'''247, '''
+seq_lens = [64, 128, 256, 512, 1024, 2048, 4096, 8192,] if not IS_DEBUG else [64]
+''' 247, 8192*2'''
 mask = None
 
 attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().float()
 
 results = []
-num_iters = 1000 if IS_BENCH else 50
-num_warms = 100 if IS_BENCH else 5
+num_iters = 1000 if IS_BENCH else 1 if IS_DEBUG else 50
+num_warms = 100 if IS_BENCH else 0 if IS_DEBUG else 5
 Br = 64 if IS_BENCH else 64
 # Br sweep (powers of two, starting from 16)
 Br_list = [16, 32, 64]
@@ -60,12 +61,13 @@ for seq_len in seq_lens:
     print(f"q_cuda shape: {q_cuda.shape}")  # need to be (batch, num_heads, seq_len, head_dim)
     
     # our kernel check
-    try:
-        output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
-        print(f"Output contains nan: {torch.isnan(output).any()}")
-        print(f"Output contains inf: {torch.isinf(output).any()}")
-    except Exception as e:
-        print(f"Error during forward call: {e}")
+    if (not IS_DEBUG):
+        try:
+            output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
+            print(f"Output contains nan: {torch.isnan(output).any()}")
+            print(f"Output contains inf: {torch.isinf(output).any()}")
+        except Exception as e:
+            print(f"Error during forward call: {e}")
 
     def torch_reference_attention(q, k, v, scale=1.0):
         qf = q.float()
@@ -80,8 +82,41 @@ for seq_len in seq_lens:
 
     output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
     output_ref = torch_reference_attention(q_cuda, k_cuda, v_cuda)
-    diff = (output_cuda.float() - output_ref.float()).abs()
-    print(f"Max diff: {diff.max().item():.9f}")
+
+    # --- diff нашего ядра ---
+    diff_cuda = (output_cuda.float() - output_ref.float()).abs()
+    print(f"Our kernel max diff vs ref: {diff_cuda.max().item():.9f}")
+
+    # --- FLASH ATTN OUTPUT ---
+    output_flash = flash_attn_func(
+        qkv,
+        cu_seqlens,
+        0.0,
+        seq_len,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        causal=False
+    )
+
+    # flash_attn_func возвращает (total_q, num_heads, head_dim)
+    # приводим к (batch, heads, seq_len, head_dim)
+    output_flash = output_flash.view(batch_size, seq_len, num_heads, head_dim) \
+                            .transpose(1, 2) \
+                            .contiguous()
+
+    # --- diff flash attn ---
+    diff_flash = (output_flash.float() - output_ref.float()).abs()
+    print(f"Torch max diff vs ref: {diff_flash.max().item():.9f}")
+
+    rel_diff_cuda = (
+        (output_cuda.float() - output_ref.float()).abs() /
+        (output_ref.float().abs() + 1e-6)
+    )
+    rel_diff_flash = (
+        (output_flash.float() - output_ref.float()).abs() /
+        (output_ref.float().abs() + 1e-6)
+    )
+    print(f"Our mean relative diff: {rel_diff_cuda.mean().item():.9f}")
+    print(f"Torch mean relative diff: {rel_diff_flash.mean().item():.9f}")
     
     startCore = torch.cuda.Event(enable_timing=True)
     endCore = torch.cuda.Event(enable_timing=True)
@@ -91,7 +126,8 @@ for seq_len in seq_lens:
     endFlash = torch.cuda.Event(enable_timing=True)
     startOurCuda = torch.cuda.Event(enable_timing=True)
     endOurCuda = torch.cuda.Event(enable_timing=True)
-
+    if (IS_DEBUG):
+        sys.exit(0)
     # GPU warm up
     for _ in range(num_warms):
         with torch.no_grad():
