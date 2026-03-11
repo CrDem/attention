@@ -8,25 +8,10 @@ using namespace nvcuda;
 
 const unsigned fullMask = 0xffffffff;
 
-__inline__ __device__
-float warp_reduce_max(float val) {  
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_down_sync(fullMask, val, offset));
-    }
-    return val;
-}
-
-__inline__ __device__
-float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(fullMask, val, offset);
-    }
-    return val;
-}
-
-const int Bc = 32; // assert Bc == warpsize for warp reduce
+const int Bc = 32;
 const int Bc_pad = 40;
-__global__ void flash_attn(
+
+__global__ void flash_attn_bc32(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
@@ -253,40 +238,4 @@ __global__ void flash_attn(
             }
         }
     }
-}
-
-extern "C" void flash_attention_launcher(
-    const __half* Q,
-    const __half* K,
-    const __half* V,
-    __half* O,
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int d_k,
-    float scale,
-    int Br
-) {
-    dim3 block_size(32, Br/8);
-    int blocks = batch_size * num_heads * ((seq_len + Br - 1) / Br); // Total Q rows
-
-    size_t shared_mem_size =
-        (Br * d_k * sizeof(float)) +   // s_O 4*64*64 = 16kb
-        (2 * Br * sizeof(float)) * 2 +    // s_row_max, s_row_sum 2*64*4*2 = 1kb
-        (Bc_pad * Br * sizeof(__half)) +   // s_A (padded) 40*64*2 = 5kb (+1)
-        (Br * (d_k + 8) * sizeof(__half)) +  // s_Q (padded) 64*72*2 = 9kb (+1)
-        (Bc * (d_k + 8) * sizeof(__half)) +  // s_K (padded) .. = 4.5kb (+0.5)
-        (Bc_pad * d_k * sizeof(__half)) +    // s_V (padded) 40*64*2 = 5kb (+1)
-        (Br * sizeof(float)) * 2;      // s_m_prev, s_d_prev 64*4*2 = 0.5kb
-        // = 41kb
-
-    cudaFuncSetAttribute(
-        flash_attn,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shared_mem_size
-    );
-        
-    flash_attn<<<blocks, block_size, shared_mem_size>>>(
-        Q, K, V, O, seq_len, d_k, scale
-    );
 }
