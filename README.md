@@ -1,5 +1,5 @@
 ![Baseline](src/benchmarks/perf_plot.png)
-![Our kernel](src/benchmarks/our_kernel_Br_bc_lines.png)
+![Our kernel](src/benchmarks/our_kernel_Br_Bc_lines.png)
 ![Heatmap8192](src/benchmarks/heatmap_seq_8192.png)
 ![Heatmap4096](src/benchmarks/heatmap_seq_4096.png)
 ![Heatmap2048](src/benchmarks/heatmap_seq_2048.png)
