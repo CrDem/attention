@@ -2,34 +2,34 @@
 #include <mma.h>
 #include <assert.h>
 #include <math_constants.h>
-#include <stdio.h>
 
 using namespace nvcuda;
 
 const unsigned fullMask = 0xffffffff;
 
-const int Bc = 32;
-const int Bc_pad = 40;
-
-__global__ void flash_attn_bc32(
+__global__ void flash_attn(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
     __half* __restrict__ O,
     const int L,
     const int D,
+    const int Bc,
     const float scale
 ) {
+    const int Bc_pad = Bc + 8;
+    const int warpsPerRow = Bc / 16;
+
     const int D_pad = D + 8;
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     
     const int numWarps = blockDim.y;
-    const int Br = blockDim.y * 8;
+    const int Br = blockDim.y / warpsPerRow * 16;
 
-    int warpColId = ty % 2;
-    int warpRowId = ty / 2;
+    int warpColId = ty % warpsPerRow;
+    int warpRowId = ty / warpsPerRow;
     const int warpColBase = warpColId * 16;
     const int warpRowBase = warpRowId * 16;
 
@@ -39,29 +39,29 @@ __global__ void flash_attn_bc32(
     float* s_m_prev = &s_O[Br * D];
     float* s_d_prev = &s_m_prev[Br];
     float* s_row_max = &s_d_prev[Br];
-    float* s_row_sum = &s_row_max[Br * 2];
+    float* s_row_sum = &s_row_max[Br * warpsPerRow];
     
-    __half* s_A = (__half*)(((uintptr_t)&s_row_sum[Br * 2] + 15) & ~15); // ensure 16B alignment on half matrices
+    __half* s_A = (__half*)(((uintptr_t)&s_row_sum[Br * warpsPerRow] + 15) & ~15); // ensure 16B alignment on half matrices
     __half* s_Q = (__half*)(((uintptr_t)&s_A[Br * Bc_pad] + 15) & ~15); 
     __half* s_K = (__half*)(((uintptr_t)&s_Q[Br * D_pad] + 15) & ~15);
     __half* s_V = (__half*)(((uintptr_t)&s_K[Bc * D_pad] + 15) & ~15);
 
     // wmma fragments
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a1_frag;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a2_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b1_frag; // col major
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag; // col major
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
 
     // aliases for code readability
-    auto& q_frag = a1_frag;
-    auto& k_frag = b1_frag;
+    auto& q_frag = a_frag;
+    auto& k_frag = b_frag;
 
-    auto& v_frag = b1_frag;
+    auto& v_frag = b_frag;
 
     // init m_prev, d_prev
-    if (tx < 8) {
-        s_m_prev[ty * 8 + tx] = -CUDART_INF_F;;
-        s_d_prev[ty * 8 + tx] = 0.0f;
+    int activePart = 16 / warpsPerRow;
+    if (tx < activePart) {
+        s_m_prev[ty * activePart + tx] = -CUDART_INF_F;
+        s_d_prev[ty * activePart + tx] = 0.0f;
     }
     // load Q, zeroing O
     for (int localRow = ty; localRow < Br; localRow += numWarps) {
@@ -90,16 +90,12 @@ __global__ void flash_attn_bc32(
         // 2. ------------ s_A <- Q x K ------------
         wmma::fill_fragment(acc_frag, 0.0f);
         
-        for (int d = 0; d < D; d += 32) {
-            // 1st half
-            wmma::load_matrix_sync(q_frag, &s_Q[warpRowBase * D_pad + d], D_pad);
-            wmma::load_matrix_sync(k_frag, &s_K[warpColBase * D_pad + d], D_pad);
-            wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
-
-            // 2nd half
-            wmma::load_matrix_sync(q_frag, &s_Q[warpRowBase * D_pad + d + 16], D_pad);
-            wmma::load_matrix_sync(k_frag, &s_K[warpColBase * D_pad + d + 16], D_pad);
-            wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+        for (int d = 0; d < D; d += 16 * warpsPerRow) {
+            for (int step = 0; step < warpsPerRow; step++) {
+                wmma::load_matrix_sync(q_frag, &s_Q[warpRowBase * D_pad + d + step * 16], D_pad);
+                wmma::load_matrix_sync(k_frag, &s_K[warpColBase * D_pad + d + step * 16], D_pad);
+                wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+            }
         }
 
         // 3. ------------ softmax ------------
@@ -127,13 +123,17 @@ __global__ void flash_attn_bc32(
         int row0 = warpRowBase + (tx / 4);
         int row1 = row0 + 8;
         if (tx % 4 == 0) {
-            s_row_max[row0 * 2 + warpColId] = local_max0;
-            s_row_max[row1 * 2 + warpColId] = local_max1;
+            s_row_max[row0 * warpsPerRow + warpColId] = local_max0;
+            s_row_max[row1 * warpsPerRow + warpColId] = local_max1;
         }
         __syncthreads();
 
-        float m_row0 = fmaxf(s_row_max[row0 * 2 + 0], s_row_max[row0 * 2 + 1]);
-        float m_row1 = fmaxf(s_row_max[row1 * 2 + 0], s_row_max[row1 * 2 + 1]);
+        float m_row0 = -CUDART_INF_F;
+        float m_row1 = -CUDART_INF_F;
+        for (int wmId = 0; wmId < warpsPerRow; wmId++) {
+            m_row0 = fmaxf(m_row0, s_row_max[row0 * warpsPerRow + wmId]);
+            m_row1 = fmaxf(m_row1, s_row_max[row1 * warpsPerRow + wmId]);
+        }
         m_row0 = fmaxf(m_row0, s_m_prev[row0]);
         m_row1 = fmaxf(m_row1, s_m_prev[row1]);
 
@@ -164,26 +164,25 @@ __global__ void flash_attn_bc32(
             exp_sum1 += __shfl_down_sync(fullMask, exp_sum1, offset);
         }
         if (tx % 4 == 0) {
-            s_row_sum[row0 * 2 + warpColId] = exp_sum0;
-            s_row_sum[row1 * 2 + warpColId] = exp_sum1;
+            s_row_sum[row0 * warpsPerRow + warpColId] = exp_sum0;
+            s_row_sum[row1 * warpsPerRow + warpColId] = exp_sum1;
         }
         __syncthreads();
 
         float num0 = (s_d_prev[row0] > 0.0f) ? s_d_prev[row0] * expf(s_m_prev[row0] - m_row0) : 0.0f;
         float num1 = (s_d_prev[row1] > 0.0f) ? s_d_prev[row1] * expf(s_m_prev[row1] - m_row1) : 0.0f;
 
-        float d0 = num0 + s_row_sum[row0 * 2 + 0] + s_row_sum[row0 * 2 + 1];
-        float d1 = num1 + s_row_sum[row1 * 2 + 0] + s_row_sum[row1 * 2 + 1];
-
-        if (tx % 4 == 0 && warpColId == 0) {
-            s_d_prev[row0] = d0;
-            s_m_prev[row0] = m_row0;
-            s_d_prev[row1] = d1;
-            s_m_prev[row1] = m_row1;
+        float d0 = num0;
+        float d1 = num1;
+        for (int wmId = 0; wmId < warpsPerRow; wmId++) {
+            d0 += s_row_sum[row0 * warpsPerRow + wmId];
+            d1 += s_row_sum[row1 * warpsPerRow + wmId];
         }
 
         // 4. ------------ O scaling ------------
-        for (int j = warpColId * 4 + tx % 4; j < D; j += 8) {
+        int threadsPerRow = 2 * 2; // 4 threads per 2 rows = 2 per row by single warp, 
+                                   // but each thread doing 2 scales -> additional *2
+        for (int j = warpColId * threadsPerRow + tx % threadsPerRow; j < D; j += threadsPerRow * warpsPerRow) {
             s_O[row0 * D + j] = s_O[row0 * D + j] * num0 / d0;
             s_O[row1 * D + j] = s_O[row1 * D + j] * num1 / d1;
         }
@@ -204,29 +203,29 @@ __global__ void flash_attn_bc32(
             s_A[row * Bc_pad + aColId] = __float2half(value);
         }
         __syncthreads();
-        
-        // load from s_A
-        wmma::load_matrix_sync(a1_frag, &s_A[warpRowBase * Bc_pad], Bc_pad);
-        wmma::load_matrix_sync(a2_frag, &s_A[warpRowBase * Bc_pad + 16], Bc_pad);
 
+        // s & m saving
+        if (tx % 4 == 0 && warpColId == 0) {
+            s_d_prev[row0] = d0;
+            s_m_prev[row0] = m_row0;
+            s_d_prev[row1] = d1;
+            s_m_prev[row1] = m_row1;
+        }
+        
         for (int j = 0; j < D; j += Bc) {
             // load current O
             wmma::load_matrix_sync(acc_frag, &s_O[warpRowBase * D + j + warpColBase], D, wmma::mem_row_major);
 
-            // 1st half
-            wmma::load_matrix_sync(v_frag, &s_V[(j + warpColBase) * Bc_pad], Bc_pad);
-            wmma::mma_sync(acc_frag, a1_frag, v_frag, acc_frag);
-
-            // 2nd half
-            wmma::load_matrix_sync(v_frag, &s_V[(j + warpColBase) * Bc_pad + 16], Bc_pad);
-            wmma::mma_sync(acc_frag, a2_frag, v_frag, acc_frag);
+            for (int step = 0; step < warpsPerRow; step++) {
+                wmma::load_matrix_sync(v_frag, &s_V[(j + warpColBase) * Bc_pad + step * 16], Bc_pad);
+                wmma::load_matrix_sync(a_frag, &s_A[warpRowBase * Bc_pad + step * 16], Bc_pad);
+                wmma::mma_sync(acc_frag, a_frag, v_frag, acc_frag);
+            }
             
             wmma::store_matrix_sync(&s_O[warpRowBase * D + j + warpColBase], acc_frag, D, wmma::mem_row_major);
         }
 
-        __syncthreads(); // можно удалить если грузить V в smem между первым и вторым синком, а не вместе с К
-        // в таком случае получим 2 синка вместо трех в цикле, но раздельную загрузку К и V
-        // по перфу получается как будто одно и то же, так что оставил совместную загрузку для читаемости
+        __syncthreads(); // можно удалить если грузить V после первого синка
     }
 
     // s_O -> O

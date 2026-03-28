@@ -6,6 +6,19 @@ import torch
 from attention import MultiHeadAttentionBlock
 from flash_attn.flash_attn_interface import flash_attn_func
 
+import random
+import numpy as np
+
+def set_seed(seed=42):
+    """Фиксирует seed для воспроизводимости результатов"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+
 IS_BENCH = "-bench" in sys.argv
 IS_DEBUG = "-debug" in sys.argv
 
@@ -24,8 +37,8 @@ batch_size = 1
 d_model = 64
 num_heads = 1
 head_dim = d_model // num_heads
-seq_lens = [64, 128, 256, 512, 1024, 2048, 4096, 8192,] if not IS_DEBUG else [64]
-''' 247, 8192*2'''
+seq_lens = [64, 128, 256, 512, 1024, 2048, 4096, 8192,] if not IS_DEBUG else [8192]
+'''247,   8192*2'''
 mask = None
 
 attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().float()
@@ -34,9 +47,11 @@ results = []
 num_iters = 1000 if IS_BENCH else 1 if IS_DEBUG else 50
 num_warms = 100 if IS_BENCH else 0 if IS_DEBUG else 5
 Br = 64 if IS_BENCH else 64
+Bc = 64 if IS_BENCH else 64
 # Br sweep (powers of two, starting from 16)
 Br_list = [16, 32, 64]
-our_kernel_sweep_results = []  # (seq_len, Br, time_ms)
+Bc_list = [16, 32, 64]
+our_kernel_sweep_results = []  # (seq_len, Br, Bc, time_ms)
 
 for seq_len in seq_lens:
     # Create random input tensors
@@ -63,7 +78,7 @@ for seq_len in seq_lens:
     # our kernel check
     if (not IS_DEBUG):
         try:
-            output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
+            output = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br, Bc=Bc)
             print(f"Output contains nan: {torch.isnan(output).any()}")
             print(f"Output contains inf: {torch.isinf(output).any()}")
         except Exception as e:
@@ -80,7 +95,7 @@ for seq_len in seq_lens:
         output = torch.matmul(attn, vf)
         return output.half()
 
-    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
+    output_cuda = forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br, Bc=Bc)
     output_ref = torch_reference_attention(q_cuda, k_cuda, v_cuda)
 
     # --- diff нашего ядра ---
@@ -161,12 +176,12 @@ for seq_len in seq_lens:
     # warm-up
     for _ in range(num_warms):
         with torch.no_grad():
-            forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
+            forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br, Bc=Bc)
     torch.cuda.synchronize()
     
     startOurCuda.record()
     for _ in range(num_iters):
-        forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br)
+        forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=Br, Bc=Bc)
     endOurCuda.record()
     torch.cuda.synchronize()
 
@@ -186,23 +201,25 @@ for seq_len in seq_lens:
     results.append((seq_len, coreAvgTimeMs, fullAvgTimeMs, flashAvgTimeMs, our_cuda_time))
 
     for br_now in Br_list:
-        # warm-up
-        for _ in range(num_warms):
-            with torch.no_grad():
-                forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=br_now)
-        torch.cuda.synchronize()
+        for bc_now in Bc_list:
+            # warm-up
+            for _ in range(num_warms):
+                with torch.no_grad():
+                    forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=br_now, Bc=bc_now)
+            torch.cuda.synchronize()
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
 
-        start.record()
-        for _ in range(num_iters):
-            forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=br_now)
-        end.record()
-        torch.cuda.synchronize()
+            start.record()
+            for _ in range(num_iters):
+                forward(q_cuda, k_cuda, v_cuda, scale=1.0, Br=br_now, Bc=bc_now)
+            end.record()
+            torch.cuda.synchronize()
 
-        avg_ms = start.elapsed_time(end) / num_iters
-        our_kernel_sweep_results.append((seq_len, br_now, avg_ms))
+            avg_ms = start.elapsed_time(end) / num_iters
+
+            our_kernel_sweep_results.append((seq_len, br_now, bc_now, avg_ms))
 
 # saving results
 import csv
@@ -217,10 +234,10 @@ with open(csv_path, "w", newline="") as f:
     writer.writerows(results)
 print(f"results saved to {csv_path}")
 
-csv_path_sweep = os.path.join(benchmarks_dir, 'our_kernel_Br_sweep.csv')
+csv_path_sweep = os.path.join(benchmarks_dir, 'our_kernel_sweep.csv')
 with open(csv_path_sweep, "w", newline="") as f:
     writer = csv.writer(f)
-    writer.writerow(["seq_len", "Br", "time_ms"])
+    writer.writerow(["seq_len", "Br", "Bc", "time_ms"])
     writer.writerows(our_kernel_sweep_results)
 
-print(f"Br sweep results saved to {csv_path_sweep}")
+print(f"Sweep results saved to {csv_path_sweep}")

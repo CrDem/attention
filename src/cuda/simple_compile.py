@@ -9,13 +9,13 @@ os.makedirs(build_dir, exist_ok=True)
 cpp_dir = os.path.join(current_dir, "flash_attention.cpp")
 cu_dir_launch = os.path.join(current_dir, "kernel_launch.cu")
 cu_dir_16 = os.path.join(current_dir, "kernel_bc16.cu")
-cu_dir_32 = os.path.join(current_dir, "kernel_bc32.cu")
+cu_dir = os.path.join(current_dir, "kernel.cu")
 
 sources=[
     cpp_dir,
     cu_dir_launch,
     cu_dir_16,
-    cu_dir_32
+    cu_dir
 ]
 
 try:
