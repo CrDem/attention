@@ -90,12 +90,10 @@ __global__ void flash_attn(
         // 2. ------------ s_A <- Q x K ------------
         wmma::fill_fragment(acc_frag, 0.0f);
         
-        for (int d = 0; d < D; d += 16 * warpsPerRow) {
-            for (int step = 0; step < warpsPerRow; step++) {
-                wmma::load_matrix_sync(q_frag, &s_Q[warpRowBase * D_pad + d + step * 16], D_pad);
-                wmma::load_matrix_sync(k_frag, &s_K[warpColBase * D_pad + d + step * 16], D_pad);
-                wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
-            }
+        for (int d = 0; d < D; d += 16) { // D - inner dim ( Q[Br, D] x K[D, Bc] )
+            wmma::load_matrix_sync(q_frag, &s_Q[warpRowBase * D_pad + d], D_pad);
+            wmma::load_matrix_sync(k_frag, &s_K[warpColBase * D_pad + d], D_pad);
+            wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
         }
 
         // 3. ------------ softmax ------------
@@ -212,13 +210,14 @@ __global__ void flash_attn(
             s_m_prev[row1] = m_row1;
         }
         
-        for (int j = 0; j < D; j += Bc) {
-            // load current O
+        for (int j = 0; j < D; j += Bc) { // if not enough warps (Bc < D)
+            if (j + warpColBase >= D) break; // if too many warps (Bc > D or Bc % D != 0)
+            // load current O (already scaled)
             wmma::load_matrix_sync(acc_frag, &s_O[warpRowBase * D + j + warpColBase], D, wmma::mem_row_major);
 
-            for (int step = 0; step < warpsPerRow; step++) {
-                wmma::load_matrix_sync(v_frag, &s_V[(j + warpColBase) * Bc_pad + step * 16], Bc_pad);
-                wmma::load_matrix_sync(a_frag, &s_A[warpRowBase * Bc_pad + step * 16], Bc_pad);
+            for (int bc_now = 0; bc_now < Bc; bc_now += 16) { // Bc - inner dim ( A[Br, Bc] x V[Bc, D] )
+                wmma::load_matrix_sync(v_frag, &s_V[(j + warpColBase) * Bc_pad + bc_now], Bc_pad);
+                wmma::load_matrix_sync(a_frag, &s_A[warpRowBase * Bc_pad + bc_now], Bc_pad);
                 wmma::mma_sync(acc_frag, a_frag, v_frag, acc_frag);
             }
             

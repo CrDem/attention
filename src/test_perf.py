@@ -21,6 +21,7 @@ set_seed(42)
 
 IS_BENCH = "-bench" in sys.argv
 IS_DEBUG = "-debug" in sys.argv
+NEED_DIFF = "-diff" in sys.argv
 
 # cuda_build folder path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,11 +47,11 @@ attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda()
 results = []
 num_iters = 1000 if IS_BENCH else 1 if IS_DEBUG else 50
 num_warms = 100 if IS_BENCH else 0 if IS_DEBUG else 5
-Br = 64 if IS_BENCH else 64
-Bc = 64 if IS_BENCH else 64
+Br = 32 if IS_BENCH else 32
+Bc = 128 if IS_BENCH else 128
 # Br sweep (powers of two, starting from 16)
 Br_list = [16, 32, 64]
-Bc_list = [16, 32, 64]
+Bc_list = [16, 32, 64, 128]
 our_kernel_sweep_results = []  # (seq_len, Br, Bc, time_ms)
 
 for seq_len in seq_lens:
@@ -202,6 +203,7 @@ for seq_len in seq_lens:
 
     for br_now in Br_list:
         for bc_now in Bc_list:
+            if bc_now == 128 and br_now == 64: continue # over smem limit for D >= 64
             # warm-up
             for _ in range(num_warms):
                 with torch.no_grad():
@@ -234,10 +236,65 @@ with open(csv_path, "w", newline="") as f:
     writer.writerows(results)
 print(f"results saved to {csv_path}")
 
+# diff vs previous run
 csv_path_sweep = os.path.join(benchmarks_dir, 'our_kernel_sweep.csv')
-with open(csv_path_sweep, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["seq_len", "Br", "Bc", "time_ms"])
-    writer.writerows(our_kernel_sweep_results)
+if NEED_DIFF:
+    diff_csv_path = os.path.join(benchmarks_dir, 'our_kernel_sweep_diff.csv')
 
-print(f"Sweep results saved to {csv_path_sweep}")
+    ABS_THRESHOLD_MS = 0.03      # 0.03 ms
+    REL_THRESHOLD = 0.03         # 3%
+
+    if os.path.exists(csv_path_sweep):
+        prev_data = {}
+
+        with open(csv_path_sweep, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (int(row["seq_len"]), int(row["Br"]), int(row["Bc"]))
+                prev_data[key] = float(row["time_ms"])
+
+        diff_rows = []
+
+        for seq_len, br, bc, new_time in our_kernel_sweep_results:
+            key = (seq_len, br, bc)
+
+            if key not in prev_data:
+                continue
+
+            old_time = prev_data[key]
+
+            diff = new_time - old_time
+            rel = abs(diff) / (old_time + 1e-9)
+
+            # пропускаем шум
+            if abs(diff) < ABS_THRESHOLD_MS and rel < REL_THRESHOLD:
+                continue
+
+            speedup = old_time / new_time if new_time > 0 else 0.0
+
+            diff_rows.append((
+                seq_len, br, bc,
+                old_time, new_time,
+                diff,
+                speedup
+            ))
+
+        if diff_rows:
+            with open(diff_csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "seq_len", "Br", "Bc",
+                    "old_ms", "new_ms",
+                    "diff_ms", "speedup_x"
+                ])
+                writer.writerows(diff_rows)
+
+            print(f"Perf diff saved to {diff_csv_path}")
+
+    # sweep save
+    with open(csv_path_sweep, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["seq_len", "Br", "Bc", "time_ms"])
+        writer.writerows(our_kernel_sweep_results)
+
+    print(f"Sweep results saved to {csv_path_sweep}")
