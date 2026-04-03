@@ -96,20 +96,7 @@ __global__ void flash_attn(
                 wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
             }
 
-            // 2. ----- store from wmma frag -----
-            for (int i = 0; i < acc_frag.num_elements; i++) {
-                bool colMask = i >= 4;
-                int aColId = warpColBase + colMask * 8 + (tx % 4) * 2 + (i % 2);
-                if (aColId >= aTileNumColsValid) continue;
-
-                float v = acc_frag.x[i] * scale;
-
-                bool rowMask = (i >> 1) & 1; // {0, 1, 2, 3, 4, 5, 6, 7} -> {0, 0, 1, 1, 0, 0, 1, 1}
-
-
-                int row = warpRowBase + rowMask * 8 + (tx / 4);
-                s_A[row * Bc_pad + aColId] = v;
-            }
+            wmma::store_matrix_sync(&s_A[warpRowBase * Bc_pad + warpColBase], acc_frag, Bc_pad, wmma::mem_row_major);
         }
         __syncthreads();
 
@@ -121,7 +108,7 @@ __global__ void flash_attn(
                 float m_thread = -CUDART_INF_F;
                 for (int xId = 0; xId < Bc / 32; xId++) {
                     if (xId * 32 + tx >= aTileNumColsValid) break;
-                    float v = s_A[aRow * Bc_pad + xId * 32 + tx];
+                    float v = s_A[aRow * Bc_pad + xId * 32 + tx] * scale;
                     m_thread = fmaxf(m_thread, v);
                 }
                 float m_local = warp_reduce_max(m_thread);
@@ -136,7 +123,7 @@ __global__ void flash_attn(
             float exp_thread = 0.0f;
             for (int xId = 0; xId < Bc / 32; xId++) {
                 if (xId * 32 + tx >= aTileNumColsValid) break;
-                float v = s_A[aRow * Bc_pad + xId * 32 + tx];
+                float v = s_A[aRow * Bc_pad + xId * 32 + tx] * scale;
                 exp_thread += expf(v - m);
             }
             float exp_sum = warp_reduce_sum(exp_thread);
@@ -159,7 +146,7 @@ __global__ void flash_attn(
             for (int xId = 0; xId < Bc / 32; xId++) {
                 if (xId * 32 + tx >= aTileNumColsValid) s_A[aRow * Bc_pad + xId * 32 + tx] = 0.0f;
                 else {
-                    float v = s_A[aRow * Bc_pad + xId * 32 + tx];
+                    float v = s_A[aRow * Bc_pad + xId * 32 + tx] * scale;
                     s_A[aRow * Bc_pad + xId * 32 + tx] = expf(v - m) / d;
                 }
             }

@@ -38,8 +38,8 @@ batch_size = 1
 d_model = 64
 num_heads = 1
 head_dim = d_model // num_heads
-seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192,] if not IS_DEBUG else [8192]
-'''247,   8192*2'''
+seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 8192*2] if not IS_DEBUG else [8192]
+'''247,   8192*2, 8192*4'''
 mask = None
 
 attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda().float()
@@ -47,11 +47,11 @@ attentionBlock = MultiHeadAttentionBlock(d_model, num_heads, dropout=0.0).cuda()
 results = []
 num_iters = 1000 if IS_BENCH else 1 if IS_DEBUG else 50
 num_warms = 100 if IS_BENCH else 0 if IS_DEBUG else 5
-Br = 32 if IS_BENCH else 32
+Br = 16 if IS_BENCH else 16
 Bc = 256 if IS_BENCH else 256
 # Br sweep (powers of two, starting from 16)
-Br_list = [16, 32, 64]
-Bc_list = [16, 32, 64, 128, 256] #
+Br_list = [16, 32, 64] # 
+Bc_list = [16, 32, 64, 128, 256] # 
 our_kernel_sweep_results = []  # (seq_len, Br, Bc, time_ms)
 
 for seq_len in seq_lens:
