@@ -38,7 +38,7 @@ batch_size = 1
 d_model = 64
 num_heads = 1
 head_dim = d_model // num_heads
-seq_lens = [64, 128, 256, 512, 1024, 2048, 4096, 8192,] if not IS_DEBUG else [8192]
+seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192,] if not IS_DEBUG else [8192]
 '''247,   8192*2'''
 mask = None
 
@@ -48,10 +48,10 @@ results = []
 num_iters = 1000 if IS_BENCH else 1 if IS_DEBUG else 50
 num_warms = 100 if IS_BENCH else 0 if IS_DEBUG else 5
 Br = 32 if IS_BENCH else 32
-Bc = 128 if IS_BENCH else 128
+Bc = 256 if IS_BENCH else 256
 # Br sweep (powers of two, starting from 16)
 Br_list = [16, 32, 64]
-Bc_list = [16, 32, 64, 128]
+Bc_list = [16, 32, 64, 128, 256] #
 our_kernel_sweep_results = []  # (seq_len, Br, Bc, time_ms)
 
 for seq_len in seq_lens:
@@ -203,7 +203,7 @@ for seq_len in seq_lens:
 
     for br_now in Br_list:
         for bc_now in Bc_list:
-            if bc_now == 128 and br_now == 64: continue # over smem limit for D >= 64
+            if bc_now >= max(Bc_list) and br_now >= 64: continue # over smem limit for D >= 64
             # warm-up
             for _ in range(num_warms):
                 with torch.no_grad():

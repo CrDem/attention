@@ -24,6 +24,7 @@ try:
         sources=sources,
         extra_cuda_cflags=[
             '-arch=sm_75',
+            #'-maxrregcount=64',
             '--use_fast_math',
             '--ptxas-options=-v',
         ],

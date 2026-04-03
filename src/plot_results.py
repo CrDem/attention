@@ -58,7 +58,6 @@ Br_values = sorted(df2["Br"].unique())
 for br in Br_values:
     sub_br = df2[df2["Br"] == br]
 
-    # усреднять не надо — у тебя уникальные точки
     for bc in sorted(sub_br["Bc"].unique()):
         sub = sub_br[sub_br["Bc"] == bc]
 
